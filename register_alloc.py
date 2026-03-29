@@ -1,96 +1,72 @@
 #!/usr/bin/env python3
-"""Register Allocator - Graph coloring register allocation for virtual registers."""
-import sys, re
+"""register_alloc - Graph coloring register allocator."""
+import argparse
 from collections import defaultdict
 
-def parse_instrs(text):
-    instrs = []
-    for line in text.strip().split("\n"):
-        line = line.strip()
-        if not line or line.startswith("#"): continue
-        instrs.append(line)
-    return instrs
+class InterferenceGraph:
+    def __init__(self): self.nodes=set();self.edges=defaultdict(set)
+    def add_node(self, n): self.nodes.add(n)
+    def add_edge(self, a, b):
+        if a!=b: self.edges[a].add(b);self.edges[b].add(a)
+    def degree(self, n): return len(self.edges.get(n,set())&self.nodes)
+    def remove(self, n):
+        self.nodes.discard(n)
+        for nb in self.edges.get(n,set()): self.edges[nb].discard(n)
+    def neighbors(self, n): return self.edges.get(n,set())&self.nodes
 
-def get_vars(instrs):
-    defs = []; uses = []
-    for instr in instrs:
-        m = re.match(r"(\w+)\s*=\s*(.*)", instr)
-        if m:
-            defs.append({m.group(1)})
-            uses.append(set(re.findall(r"[a-zA-Z_]\w*", m.group(2))))
-        else:
-            defs.append(set())
-            uses.append(set(re.findall(r"[a-zA-Z_]\w*", instr)) - {"print", "return", "if", "goto"})
-    return defs, uses
-
-def liveness(instrs, defs_list, uses_list):
-    n = len(instrs)
-    live_in = [set() for _ in range(n)]
-    live_out = [set() for _ in range(n)]
-    changed = True
-    while changed:
-        changed = False
-        for i in range(n - 1, -1, -1):
-            new_out = live_in[i + 1] if i + 1 < n else set()
-            new_in = uses_list[i] | (new_out - defs_list[i])
-            if new_in != live_in[i] or new_out != live_out[i]:
-                live_in[i] = new_in; live_out[i] = new_out; changed = True
-    return live_in, live_out
-
-def build_interference(live_out, defs_list):
-    graph = defaultdict(set)
-    all_vars = set()
-    for lo, d in zip(live_out, defs_list):
-        all_vars |= lo | d
-        for v in d:
-            for u in lo:
-                if u != v:
-                    graph[v].add(u); graph[u].add(v)
-    for v in all_vars:
-        graph.setdefault(v, set())
-    return graph
+def build_interference(live_ranges):
+    g=InterferenceGraph()
+    for var,rng in live_ranges.items(): g.add_node(var)
+    vars_list=list(live_ranges.keys())
+    for i in range(len(vars_list)):
+        for j in range(i+1,len(vars_list)):
+            a,b=vars_list[i],vars_list[j]
+            ra,rb=live_ranges[a],live_ranges[b]
+            if ra[0]<=rb[1] and rb[0]<=ra[1]: g.add_edge(a,b)
+    return g
 
 def color_graph(graph, k):
-    nodes = list(graph.keys())
-    stack = []; removed = set(); temp_graph = {n: set(s) for n, s in graph.items()}
-    while len(removed) < len(nodes):
-        found = False
-        for n in nodes:
-            if n in removed: continue
-            degree = len(temp_graph[n] - removed)
-            if degree < k:
-                stack.append(n); removed.add(n); found = True; break
-        if not found:
-            for n in nodes:
-                if n not in removed:
-                    stack.append(n); removed.add(n); break
-    colors = {}
+    """Chaitin-style graph coloring with simplification and spilling."""
+    allocation={};spilled=set()
+    stack=[];nodes=set(graph.nodes)
+    remaining=InterferenceGraph()
+    remaining.nodes=set(nodes)
+    remaining.edges=defaultdict(set)
+    for n in nodes:
+        for nb in graph.edges.get(n,set()):
+            if nb in nodes: remaining.edges[n].add(nb)
+    while remaining.nodes:
+        simplified=False
+        for n in list(remaining.nodes):
+            if remaining.degree(n)<k:
+                stack.append((n,set(remaining.neighbors(n))))
+                remaining.remove(n);simplified=True;break
+        if not simplified:
+            spill=max(remaining.nodes,key=lambda n:remaining.degree(n))
+            spilled.add(spill);remaining.remove(spill)
     while stack:
-        n = stack.pop()
-        used = {colors[nb] for nb in graph[n] if nb in colors}
+        n,neighbors=stack.pop()
+        used={allocation[nb] for nb in neighbors if nb in allocation}
         for c in range(k):
-            if c not in used: colors[n] = c; break
-        else:
-            colors[n] = -1
-    return colors
+            if c not in used: allocation[n]=c;break
+        else: spilled.add(n)
+    return allocation, spilled
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: register_alloc.py <file> [num-registers]"); sys.exit(1)
-    k = int(sys.argv[2]) if len(sys.argv) > 2 else 4
-    with open(sys.argv[1]) as f:
-        instrs = parse_instrs(f.read())
-    defs_list, uses_list = get_vars(instrs)
-    live_in, live_out = liveness(instrs, defs_list, uses_list)
-    graph = build_interference(live_out, defs_list)
-    colors = color_graph(graph, k)
-    reg_names = [f"R{i}" for i in range(k)]
-    print(f"Register allocation ({k} registers):\n")
-    for var, color in sorted(colors.items()):
-        reg = reg_names[color] if 0 <= color < k else "SPILL"
-        print(f"  {var:10s} -> {reg}")
-    spills = sum(1 for c in colors.values() if c < 0 or c >= k)
-    if spills: print(f"\n{spills} variable(s) need spilling")
+    p=argparse.ArgumentParser(description="Register allocator")
+    p.add_argument("-k","--registers",type=int,default=3)
+    args=p.parse_args()
+    live_ranges={"a":(0,5),"b":(1,8),"c":(3,6),"d":(5,10),"e":(7,12),"f":(0,3),"g":(9,12),"h":(2,4)}
+    graph=build_interference(live_ranges)
+    print(f"Interference graph: {len(graph.nodes)} vars")
+    for n in sorted(graph.nodes):
+        nbs=sorted(graph.edges.get(n,set()))
+        print(f"  {n}: interferes with {nbs}")
+    alloc,spilled=color_graph(graph,args.k)
+    reg_names=[f"R{i}" for i in range(args.k)]
+    print(f"\nAllocation ({args.k} registers):")
+    for v in sorted(alloc): print(f"  {v} -> {reg_names[alloc[v]]}")
+    if spilled: print(f"  Spilled: {sorted(spilled)}")
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
