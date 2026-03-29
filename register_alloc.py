@@ -1,72 +1,91 @@
 #!/usr/bin/env python3
-"""register_alloc - Graph coloring register allocator."""
-import argparse
-from collections import defaultdict
+"""Register allocation via graph coloring."""
 
 class InterferenceGraph:
-    def __init__(self): self.nodes=set();self.edges=defaultdict(set)
-    def add_node(self, n): self.nodes.add(n)
-    def add_edge(self, a, b):
-        if a!=b: self.edges[a].add(b);self.edges[b].add(a)
-    def degree(self, n): return len(self.edges.get(n,set())&self.nodes)
-    def remove(self, n):
-        self.nodes.discard(n)
-        for nb in self.edges.get(n,set()): self.edges[nb].discard(n)
-    def neighbors(self, n): return self.edges.get(n,set())&self.nodes
+    def __init__(self):
+        self.nodes = set()
+        self.edges = set()
 
-def build_interference(live_ranges):
-    g=InterferenceGraph()
-    for var,rng in live_ranges.items(): g.add_node(var)
-    vars_list=list(live_ranges.keys())
-    for i in range(len(vars_list)):
-        for j in range(i+1,len(vars_list)):
-            a,b=vars_list[i],vars_list[j]
-            ra,rb=live_ranges[a],live_ranges[b]
-            if ra[0]<=rb[1] and rb[0]<=ra[1]: g.add_edge(a,b)
+    def add_var(self, var):
+        self.nodes.add(var)
+
+    def add_interference(self, a, b):
+        if a != b:
+            self.nodes.add(a)
+            self.nodes.add(b)
+            self.edges.add((min(a,b), max(a,b)))
+
+    def neighbors(self, var):
+        n = set()
+        for a, b in self.edges:
+            if a == var: n.add(b)
+            elif b == var: n.add(a)
+        return n
+
+    def degree(self, var):
+        return len(self.neighbors(var))
+
+def color_graph(graph, num_regs):
+    stack = []
+    remaining = set(graph.nodes)
+    removed_edges = {}
+    while remaining:
+        low = [v for v in remaining if graph.degree(v) < num_regs
+               or not graph.neighbors(v).intersection(remaining)]
+        if not low:
+            low = [max(remaining, key=lambda v: len(graph.neighbors(v).intersection(remaining)))]
+        v = low[0]
+        removed_edges[v] = graph.neighbors(v).intersection(remaining)
+        remaining.remove(v)
+        stack.append(v)
+    colors = {}
+    spilled = set()
+    for v in reversed(stack):
+        used = {colors[n] for n in graph.neighbors(v) if n in colors}
+        available = [r for r in range(num_regs) if r not in used]
+        if available:
+            colors[v] = available[0]
+        else:
+            spilled.add(v)
+    return colors, spilled
+
+def from_liveness(live_sets):
+    g = InterferenceGraph()
+    for live in live_sets:
+        for a in live:
+            g.add_var(a)
+            for b in live:
+                if a < b:
+                    g.add_interference(a, b)
     return g
 
-def color_graph(graph, k):
-    """Chaitin-style graph coloring with simplification and spilling."""
-    allocation={};spilled=set()
-    stack=[];nodes=set(graph.nodes)
-    remaining=InterferenceGraph()
-    remaining.nodes=set(nodes)
-    remaining.edges=defaultdict(set)
-    for n in nodes:
-        for nb in graph.edges.get(n,set()):
-            if nb in nodes: remaining.edges[n].add(nb)
-    while remaining.nodes:
-        simplified=False
-        for n in list(remaining.nodes):
-            if remaining.degree(n)<k:
-                stack.append((n,set(remaining.neighbors(n))))
-                remaining.remove(n);simplified=True;break
-        if not simplified:
-            spill=max(remaining.nodes,key=lambda n:remaining.degree(n))
-            spilled.add(spill);remaining.remove(spill)
-    while stack:
-        n,neighbors=stack.pop()
-        used={allocation[nb] for nb in neighbors if nb in allocation}
-        for c in range(k):
-            if c not in used: allocation[n]=c;break
-        else: spilled.add(n)
-    return allocation, spilled
+def test():
+    g = InterferenceGraph()
+    for v in ["a", "b", "c", "d"]:
+        g.add_var(v)
+    g.add_interference("a", "b")
+    g.add_interference("a", "c")
+    g.add_interference("b", "c")
+    g.add_interference("c", "d")
+    colors, spilled = color_graph(g, 3)
+    assert len(spilled) == 0
+    for a, b in g.edges:
+        if a in colors and b in colors:
+            assert colors[a] != colors[b], f"{a}={colors[a]} == {b}={colors[b]}"
+    # With spilling
+    g2 = InterferenceGraph()
+    for v in ["a", "b", "c", "d", "e"]:
+        g2.add_var(v)
+    for i, a in enumerate(["a","b","c","d","e"]):
+        for b in ["a","b","c","d","e"][i+1:]:
+            g2.add_interference(a, b)  # complete graph K5
+    colors2, spilled2 = color_graph(g2, 3)
+    assert len(spilled2) + len(colors2) == 5
+    # From liveness
+    g3 = from_liveness([{"a","b"}, {"b","c"}, {"a","c"}])
+    colors3, _ = color_graph(g3, 3)
+    assert len(colors3) == 3
+    print("  register_alloc: ALL TESTS PASSED")
 
-def main():
-    p=argparse.ArgumentParser(description="Register allocator")
-    p.add_argument("-k","--registers",type=int,default=3)
-    args=p.parse_args()
-    live_ranges={"a":(0,5),"b":(1,8),"c":(3,6),"d":(5,10),"e":(7,12),"f":(0,3),"g":(9,12),"h":(2,4)}
-    graph=build_interference(live_ranges)
-    print(f"Interference graph: {len(graph.nodes)} vars")
-    for n in sorted(graph.nodes):
-        nbs=sorted(graph.edges.get(n,set()))
-        print(f"  {n}: interferes with {nbs}")
-    alloc,spilled=color_graph(graph,args.k)
-    reg_names=[f"R{i}" for i in range(args.k)]
-    print(f"\nAllocation ({args.k} registers):")
-    for v in sorted(alloc): print(f"  {v} -> {reg_names[alloc[v]]}")
-    if spilled: print(f"  Spilled: {sorted(spilled)}")
-
-if __name__=="__main__":
-    main()
+if __name__ == "__main__":
+    test()

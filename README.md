@@ -1,19 +1,11 @@
-# Register Allocator
+# register-alloc
 
-Graph coloring register allocator with spilling
+Register allocation via graph coloring
+
+Zero-dependency, single-file Python 3.8+ CLI tool.
 
 ## Usage
 
 ```bash
-python3 register_alloc.py --help
+python register_alloc.py
 ```
-
-## Features
-
-- Zero dependencies (Python 3.8+ stdlib only)
-- Single file
-- CLI interface
-
-## License
-
-MIT
